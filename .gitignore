@@ -121,4 +121,22 @@ datasets/
 OPTIC/logs/
 OPTIC/prediction_results/
 
+# Model artifacts
+*.pth
+*.pt
+*.ckpt
+*.safetensors
+*.onnx
+*.h5
+*.hdf5
+
+# Runtime output
+logs/
+runs/
+outputs/
+output/
+prediction_results/
+*.out
+*.err
+slurm-*
 

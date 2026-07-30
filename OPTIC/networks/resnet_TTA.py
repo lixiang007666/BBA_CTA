@@ -121,7 +121,7 @@ class ResNet(nn.Module):
 
         self.avgpool = nn.AvgPool2d(7, stride=1)
         self.fc = nn.Linear(512 * block.expansion, num_classes)
-        self.my_module_64 = bba(64, 8)
+        self.my_module_64 = bba(64)
 
         if freeze_backbone:
             for name, params in self.named_parameters():
@@ -174,7 +174,7 @@ class ResNet(nn.Module):
         b, c, h, w = x.shape[:]
         x = x.flatten(2).transpose(1, 2)
         x = self.my_module_64(x, (h, w))
-        x = x.view(b, h, w, c).permute(0, 3, 1, 2)
+        x = x.reshape(b, h, w, c).permute(0, 3, 1, 2)
 
         x = self.layer1(x)
         sfs.append(x)

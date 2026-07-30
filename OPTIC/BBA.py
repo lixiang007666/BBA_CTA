@@ -3,7 +3,6 @@ import torch
 import numpy as np
 import argparse, sys, datetime
 from config import Logger
-from torch.autograd import Variable
 from utils.convert import AdaBN
 from utils.metrics import calculate_metrics
 from networks.ResUnet_TTA import ResUnet
@@ -12,31 +11,58 @@ from dataloaders.OPTIC_dataloader import OPTIC_dataset
 from dataloaders.transform import collate_fn_wo_transform
 from dataloaders.convert_csv_to_list import convert_labeled_list
 from tqdm import tqdm
-import torch.nn as nn
 import torch.nn.functional as F
-import pdb
-import matplotlib.pyplot as plt
-from PIL import Image
-import os
 
 
 torch.set_num_threads(1)
 
 
-class DiceLoss(nn.Module):
-    def __init__(self, smooth=1.0):
-        super(DiceLoss, self).__init__()
-        self.smooth = smooth
+@torch.no_grad()
+def dual_reliability_targets(logits, features, gamma=0.75, eta=0.05, eps=1e-6):
+    """Implement the entropy and prototype filters in Eqs. (7)-(12)."""
+    probabilities = torch.sigmoid(logits).clamp(eps, 1.0 - eps)
+    pseudo_labels = (probabilities >= gamma).to(probabilities.dtype)
+    entropy = -(
+        probabilities * probabilities.log()
+        + (1.0 - probabilities) * (1.0 - probabilities).log()
+    )
+    entropy_mask = entropy < eta
 
-    def forward(self, logits, targets):
-        probs = torch.sigmoid(logits)
-        probs = probs.view(probs.size(0), -1)
-        targets = targets.view(targets.size(0), -1).float()
-        intersection = (probs * targets).sum(dim=1)
-        dice = (2.0 * intersection + self.smooth) / (
-            probs.sum(dim=1) + targets.sum(dim=1) + self.smooth
+    if features.shape[-2:] != probabilities.shape[-2:]:
+        features = F.interpolate(
+            features, size=probabilities.shape[-2:], mode="bilinear", align_corners=False
         )
-        return 1 - dice.mean()
+
+    feature_grid = features.unsqueeze(1)
+    object_weights = entropy_mask * pseudo_labels * probabilities
+    background_weights = entropy_mask * (1.0 - pseudo_labels) * (1.0 - probabilities)
+
+    object_count = object_weights.sum(dim=(-2, -1), keepdim=True)
+    background_count = background_weights.sum(dim=(-2, -1), keepdim=True)
+    object_prototype = (
+        feature_grid * object_weights.unsqueeze(2)
+    ).sum(dim=(-2, -1), keepdim=True) / object_count.unsqueeze(2).clamp_min(eps)
+    background_prototype = (
+        feature_grid * background_weights.unsqueeze(2)
+    ).sum(dim=(-2, -1), keepdim=True) / background_count.unsqueeze(2).clamp_min(eps)
+
+    object_distance = ((feature_grid - object_prototype) ** 2).sum(dim=2)
+    background_distance = ((feature_grid - background_prototype) ** 2).sum(dim=2)
+    prototype_mask = torch.where(
+        pseudo_labels.bool(),
+        object_distance < background_distance,
+        background_distance < object_distance,
+    )
+    valid_prototypes = (object_count > eps) & (background_count > eps)
+    reliability_mask = entropy_mask & prototype_mask & valid_prototypes
+    return pseudo_labels, reliability_mask.to(probabilities.dtype)
+
+
+def reliable_bce_loss(logits, pseudo_labels, reliability_mask):
+    per_pixel = F.binary_cross_entropy_with_logits(
+        logits, pseudo_labels, reduction="none"
+    )
+    return (per_pixel * reliability_mask).sum() / reliability_mask.sum().clamp_min(1.0)
 
 
 class BBA:
@@ -48,10 +74,9 @@ class BBA:
             os.makedirs(log_root)
         log_path = os.path.join(log_root, time_now + ".log")
         sys.stdout = Logger(log_path, sys.stdout)
-        # self.segmentation_loss_fn = nn.CrossEntropyLoss().to("cuda")
-        self.segmentation_loss_fn = DiceLoss().to("cuda")
-        self.lambda_bn = 0.3
-        self.lambda_seg = 0.7
+        self.alpha = config.alpha
+        self.gamma = config.gamma
+        self.eta = config.eta
 
         # Data Loading
         target_test_csv = []
@@ -61,14 +86,16 @@ class BBA:
                 target_test_csv.append(target + "_test.csv")
             else:
                 target_test_csv.append(target + ".csv")
-        ts_img_list, ts_label_list, pseudo_label_list = convert_labeled_list(
+        ts_img_list, ts_label_list = convert_labeled_list(
             config.dataset_root, target_test_csv
         )
+        if config.max_samples is not None:
+            ts_img_list = ts_img_list[: config.max_samples]
+            ts_label_list = ts_label_list[: config.max_samples]
         target_test_dataset = OPTIC_dataset(
             config.dataset_root,
             ts_img_list,
             ts_label_list,
-            pseudo_label_list,
             config.image_size,
             img_normalize=True,
         )
@@ -101,10 +128,10 @@ class BBA:
         # GPU
         self.device = config.device
 
-        # Warm-up
-        self.warm_n = config.warm_n
+        self.bn_tau = config.bn_tau
 
         self.iters = config.iters
+        self.rounds = config.rounds
 
         # Initialize the pre-trained model and optimizer
         self.build_model()
@@ -120,7 +147,7 @@ class BBA:
             num_classes=self.out_ch,
             pretrained=False,
             newBN=AdaBN,
-            warm_n=self.warm_n,
+            bn_tau=self.bn_tau,
         ).to(self.device)
 
         checkpoint = torch.load(
@@ -128,7 +155,11 @@ class BBA:
         )
 
         model_dict = self.model.state_dict()
-        pretrained_dict = {k: v for k, v in checkpoint.items() if k in model_dict}
+        pretrained_dict = {
+            k: v
+            for k, v in checkpoint.items()
+            if k in model_dict and "my_module" not in k
+        }
         model_dict.update(pretrained_dict)
 
         self.model.load_state_dict(model_dict, strict=False)
@@ -137,6 +168,7 @@ class BBA:
         for name, param in self.model.named_parameters():
             if param.requires_grad:
                 trainable_params.append(param)
+        print(f"Trainable PEOA parameters: {sum(p.numel() for p in trainable_params):,}")
 
         if self.optim == "SGD":
             self.optimizer = torch.optim.SGD(
@@ -163,32 +195,33 @@ class BBA:
     def run(self):
         metric_dict = ["Disc_Dice", "Disc_ASD", "Cup_Dice", "Cup_ASD"]
 
-        metrics_test = [[], [], [], []]
-
         result_save_dir = "./prediction_results/"
         if not os.path.exists(result_save_dir):
             os.makedirs(result_save_dir)
 
-        for pass_num in range(1):
+        for pass_num in range(self.rounds):
+            metrics_test = [[], [], [], []]
+            reliable_pixels = 0
+            total_pixels = 0
             for batch, data in enumerate(
                 tqdm(self.target_test_loader, desc="Processing batches", ncols=100)
             ):
-                # TODO(lixiang): Update generate pseudo label
-                x, y, pseudo_label = data["data"], data["mask"], data["pseudo_mask"]
+                x, y = data["data"], data["mask"]
                 x = torch.from_numpy(x).to(dtype=torch.float32)
                 y = torch.from_numpy(y).to(dtype=torch.long)
-                pseudo_label = torch.from_numpy(pseudo_label).to(dtype=torch.long)
-
-                x, y, pseudo_label = (
-                    Variable(x).to(self.device),
-                    Variable(y).to(self.device),
-                    Variable(pseudo_label).to(self.device),
-                )
+                x, y = x.to(self.device), y.to(self.device)
 
                 self.model.eval()
                 self.model.change_BN_status(new_sample=True)
+                with torch.no_grad():
+                    initial_logits, _, initial_features = self.model(x)
+                pseudo_label, reliability_mask = dual_reliability_targets(
+                    initial_logits, initial_features, gamma=self.gamma, eta=self.eta
+                )
+                reliable_pixels += int(reliability_mask.sum().item())
+                total_pixels += reliability_mask.numel()
+                self.model.change_BN_status(new_sample=False)
 
-                # Train hook for n iters (2 iter in our BBA-CTA)
                 for tr_iter in range(self.iters):
                     pred_logit, fea, head_input = self.model(x)
                     times, bn_loss = 0, 0
@@ -196,11 +229,19 @@ class BBA:
                         if isinstance(m, AdaBN):
                             bn_loss += m.bn_loss
                             times += 1
-                    loss = bn_loss / times
+                    bn_loss = bn_loss / max(times, 1)
+                    seg_loss = reliable_bce_loss(
+                        pred_logit, pseudo_label, reliability_mask
+                    )
+                    loss = seg_loss + self.alpha * bn_loss
 
-                    seg_loss = self.segmentation_loss_fn(pred_logit, pseudo_label)
-
-                    loss = self.lambda_bn * bn_loss + self.lambda_seg * seg_loss
+                    if batch < 3:
+                        print(
+                            f"batch={batch} iter={tr_iter + 1} "
+                            f"reliable={reliability_mask.mean().item():.6f} "
+                            f"seg_loss={seg_loss.item():.6f} "
+                            f"bn_loss={bn_loss.item():.6f} total={loss.item():.6f}"
+                        )
 
                     self.optimizer.zero_grad()
                     loss.backward()
@@ -212,6 +253,7 @@ class BBA:
                 # self.prompt.eval()
                 with torch.no_grad():
                     pred_logit, fea, head_input = self.model(x)
+                self.model.commit_memory()
 
                 # Calculate the metrics
                 seg_output = torch.sigmoid(pred_logit)
@@ -226,7 +268,11 @@ class BBA:
             print_test_metric_mean = {}
             for i in range(len(test_metrics_y)):
                 print_test_metric_mean[metric_dict[i]] = test_metrics_y[i]
-            print("Test Metrics: ", print_test_metric_mean)
+            print(f"Round {pass_num + 1} Test Metrics: ", print_test_metric_mean)
+            print(
+                "Reliable pseudo-label pixels:",
+                f"{100.0 * reliable_pixels / max(total_pixels, 1):.4f}%",
+            )
             print(
                 "Mean Dice:",
                 (
@@ -246,7 +292,12 @@ if __name__ == "__main__":
         default="RIM_ONE_r3",
         help="RIM_ONE_r3/REFUGE/ORIGA/REFUGE_Valid/Drishti_GS",
     )
-    parser.add_argument("--Target_Dataset", type=list)
+    parser.add_argument(
+        "--target_datasets",
+        nargs="+",
+        choices=["RIM_ONE_r3", "REFUGE", "ORIGA", "REFUGE_Valid", "Drishti_GS"],
+        help="Ordered target-domain stream; defaults to every non-source domain.",
+    )
 
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--image_size", type=int, default=512)
@@ -269,7 +320,12 @@ if __name__ == "__main__":
     # Training
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--iters", type=int, default=2)
-    parser.add_argument("--warm_n", type=int, default=5)
+    parser.add_argument("--rounds", type=int, default=1)
+    parser.add_argument("--max_samples", type=int)
+    parser.add_argument("--alpha", type=float, default=0.3)
+    parser.add_argument("--gamma", type=float, default=0.75)
+    parser.add_argument("--eta", type=float, default=0.05)
+    parser.add_argument("--bn_tau", type=float, default=0.01)
 
     # Path
     parser.add_argument("--path_save_log", type=str, default="./logs")
@@ -281,14 +337,12 @@ if __name__ == "__main__":
 
     config = parser.parse_args()
 
-    config.Target_Dataset = [
-        "RIM_ONE_r3",
-        "REFUGE",
-        "ORIGA",
-        "REFUGE_Valid",
-        "Drishti_GS",
+    all_datasets = ["RIM_ONE_r3", "REFUGE", "ORIGA", "REFUGE_Valid", "Drishti_GS"]
+    config.Target_Dataset = config.target_datasets or [
+        dataset for dataset in all_datasets if dataset != config.Source_Dataset
     ]
-    config.Target_Dataset.remove(config.Source_Dataset)
+    if config.Source_Dataset in config.Target_Dataset:
+        parser.error("The source dataset cannot also be a target dataset.")
 
     TTA = BBA(config)
     # pdb.set_trace()

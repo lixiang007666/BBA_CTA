@@ -1,0 +1,23 @@
+name: peoa-cta
+channels:
+  - pytorch
+  - nvidia
+  - defaults
+dependencies:
+  - python=3.10
+  - pytorch=2.3.0
+  - torchvision=0.18.0
+  - pytorch-cuda=12.1
+  - numpy=1.26.4
+  - pandas
+  - pillow
+  - scipy
+  - pip
+  - pip:
+      - batchgenerators==0.25.1
+      - matplotlib==3.8.4
+      - medpy==0.5.2
+      - opencv-python==4.11.0.86
+      - scikit-image==0.23.2
+      - torchnet==0.0.4
+      - tqdm==4.66.4

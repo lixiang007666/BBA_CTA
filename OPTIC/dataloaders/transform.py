@@ -72,19 +72,12 @@ def collate_fn_w_transform(batch):
 
 
 def collate_fn_wo_transform(batch):
-    image, label, pseudo_label, name = zip(*batch)
+    image, label, name = zip(*batch)
     image = np.stack(image, 0)
     label = np.stack(label, 0)
-    pseudo_label = np.stack(pseudo_label, 0)
     name = np.stack(name, 0)
-    data_dict = {
-        "data": image,
-        "mask": label,
-        "pseudo_mask": pseudo_label,
-        "name": name,
-    }
+    data_dict = {"data": image, "mask": label, "name": name}
     data_dict["mask"] = to_one_hot_list(data_dict["mask"])
-    data_dict["pseudo_mask"] = to_one_hot_list(data_dict["pseudo_mask"])
     return data_dict
 
 

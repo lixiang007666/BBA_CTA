@@ -3,9 +3,9 @@ import numpy as np
 
 
 class AdaBN(nn.BatchNorm2d):
-    def __init__(self, in_ch, warm_n=5):
+    def __init__(self, in_ch, tau=0.01):
         super(AdaBN, self).__init__(in_ch)
-        self.warm_n = warm_n
+        self.tau = tau
         self.sample_num = 0
         self.new_sample = False
 
@@ -20,7 +20,8 @@ class AdaBN(nn.BatchNorm2d):
         src_mu = self.running_mean.view(1, C, 1, 1)
         src_var = self.running_var.view(1, C, 1, 1)
 
-        moment = 1 / ((np.sqrt(self.sample_num) / self.warm_n) + 1)
+        # Eq. (14): lambda_i = 1 / sqrt(i / tau + 1).
+        moment = 1 / np.sqrt(self.sample_num / self.tau + 1)
 
         new_mu = moment * cur_mu + (1 - moment) * src_mu
         new_var = moment * cur_var + (1 - moment) * src_var
@@ -46,10 +47,10 @@ class AdaBN(nn.BatchNorm2d):
 
 
 def convert_encoder_to_target(
-    net, norm, start=0, end=5, verbose=True, bottleneck=False, input_size=512, warm_n=5
+    net, norm, start=0, end=5, verbose=True, bottleneck=False, input_size=512, tau=0.01
 ):
     def convert_norm(old_norm, new_norm, num_features, idx, fea_size):
-        norm_layer = new_norm(num_features, warm_n).to(net.conv1.weight.device)
+        norm_layer = new_norm(num_features, tau).to(net.conv1.weight.device)
         if hasattr(norm_layer, "load_old_dict"):
             info = "Converted to : {}".format(norm)
             norm_layer.load_old_dict(old_norm)
@@ -115,10 +116,10 @@ def convert_encoder_to_target(
 
 
 def convert_decoder_to_target(
-    net, norm, start=0, end=5, verbose=True, input_size=512, warm_n=5
+    net, norm, start=0, end=5, verbose=True, input_size=512, tau=0.01
 ):
     def convert_norm(old_norm, new_norm, num_features, idx, fea_size):
-        norm_layer = new_norm(num_features, warm_n).to(old_norm.weight.device)
+        norm_layer = new_norm(num_features, tau).to(old_norm.weight.device)
         if hasattr(norm_layer, "load_old_dict"):
             info = "Converted to : {}".format(norm)
             norm_layer.load_old_dict(old_norm)

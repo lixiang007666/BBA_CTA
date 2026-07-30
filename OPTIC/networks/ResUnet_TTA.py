@@ -44,7 +44,7 @@ class ResUnet(nn.Module):
         pretrained=False,
         convert=True,
         newBN=AdaBN,
-        warm_n=5,
+        bn_tau=0.01,
         freeze_backbone=True,
     ):
         super().__init__()
@@ -69,14 +69,13 @@ class ResUnet(nn.Module):
         self.up4 = UnetBlock(256, feature_channels[0], 256)
 
         self.up5 = nn.ConvTranspose2d(256, 32, 2, stride=2)
-        self.conv_end = nn.Conv2d(32, 64, kernel_size=1)
         self.bnout = nn.BatchNorm2d(32)
 
-        self.my_module = self.res.my_module_64
+        # The paper inserts two independent PEOA modules: one after the
+        # backbone input layer and one immediately before the segmentation head.
+        self.my_module = bba(32)
 
         self.seg_head = nn.Conv2d(32, self.num_classes, 1)
-
-        self.conv_after_my_module = nn.Conv2d(64, 32, kernel_size=1)
 
         # Convert BN layer
         self.newBN = newBN
@@ -88,7 +87,7 @@ class ResUnet(nn.Module):
                 end=5,
                 verbose=False,
                 bottleneck=bottleneck,
-                warm_n=warm_n,
+                tau=bn_tau,
             )
             self.up1, self.up2, self.up3, self.up4, self.bnout = (
                 convert_decoder_to_target(
@@ -97,7 +96,7 @@ class ResUnet(nn.Module):
                     start=0,
                     end=5,
                     verbose=False,
-                    warm_n=warm_n,
+                    tau=bn_tau,
                 )
             )
 
@@ -159,6 +158,10 @@ class ResUnet(nn.Module):
             if isinstance(m, self.newBN):
                 m.new_sample = 0
 
+    def commit_memory(self):
+        self.res.my_module_64.commit_memory()
+        self.my_module.commit_memory()
+
     def forward(self, x):
         x, sfs = self.res(x)
         x = F.relu(x)
@@ -168,14 +171,11 @@ class ResUnet(nn.Module):
         x = self.up3(x, sfs[1])
         x = self.up4(x, sfs[0])
         x = self.up5(x)
-        x = self.conv_end(x)
 
         b, c, h, w = x.shape[:]
         x = x.flatten(2).transpose(1, 2)
         x = self.my_module(x, (h, w))
-        x = x.view(b, h, w, c).permute(0, 3, 1, 2)
-
-        x = self.conv_after_my_module(x)
+        x = x.reshape(b, h, w, c).permute(0, 3, 1, 2)
 
         head_input = F.relu(self.bnout(x))
 
